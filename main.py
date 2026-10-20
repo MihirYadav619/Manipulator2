@@ -21,12 +21,53 @@ from utils import *
 # PART 1: Trajectory Generation
 # ==============================================================================
 
-def generate_pattern(shape, scale=0.1):
+def _resample_by_arclength(pts, spacing):
+    """Dense curve ko equal arc-length spacing pe resample karta hai."""
+    pts = np.asarray(pts, dtype=float)
+    seg_len = np.linalg.norm(np.diff(pts, axis=0), axis=1)     # har chhote segment ki length
+    s = np.concatenate([[0.0], np.cumsum(seg_len)])            # cumulative arc length
+    n = max(int(np.ceil(s[-1] / spacing)), 2) + 1              # kitne points chahiye
+    s_new = np.linspace(0.0, s[-1], n)                         # equally spaced arc-length values
+    x = np.interp(s_new, s, pts[:, 0])
+    y = np.interp(s_new, s, pts[:, 1])
+    return np.column_stack([x, y])
+
+
+def generate_pattern(shape, scale=0.1, spacing=None):
     """
-    TODO 1: Implement shape trajectory generation.
-    Returns a list of strokes (each stroke is a list of (x,y) tuples).
+    TODO 1: Returns a list of strokes (each stroke is a list of (x,y) tuples).
+    `scale` = largest dimension of the shape in meters; shape is centered at origin.
     """
-    raise NotImplementedError("TODO 1: Write the code to generate the (x,y) coordinates for the shapes: \'circle\', \'spiral\', \'infinity\', and \'heart\'.")
+    if spacing is None:
+        spacing = STROKE_SPEED * 0.15        # ~6 mm -> har segment ~0.15 s (min duration)
+
+    t = np.linspace(0.0, 2.0 * np.pi, 4000)  # dense parameter sweep
+
+    if shape == "circle":
+        x, y = np.cos(t), np.sin(t)
+    elif shape == "spiral":
+        turns = 3
+        theta = np.linspace(0.0, 2.0 * np.pi * turns, 6000)
+        r = theta / theta[-1]                # radius 0 se 1 tak linearly
+        x, y = r * np.cos(theta), r * np.sin(theta)
+    elif shape == "infinity":
+        d = 1.0 + np.sin(t) ** 2
+        x, y = np.cos(t) / d, np.sin(t) * np.cos(t) / d
+    elif shape == "heart":
+        x = 16 * np.sin(t) ** 3
+        y = 13 * np.cos(t) - 5 * np.cos(2 * t) - 2 * np.cos(3 * t) - np.cos(4 * t)
+    else:
+        raise ValueError(f"Unknown shape '{shape}'. Use circle, spiral, infinity, heart.")
+
+    pts = np.column_stack([x, y])
+
+    # Normalize: bounding box ka center origin pe, sabse badi side = scale
+    center = (pts.max(axis=0) + pts.min(axis=0)) / 2.0
+    pts = pts - center
+    pts = pts * (scale / np.ptp(pts, axis=0).max())
+
+    pts = _resample_by_arclength(pts, spacing)
+    return [[(float(px), float(py)) for px, py in pts]]   # ek hi continuous stroke
 
 
 # ==============================================================================
@@ -35,23 +76,77 @@ def generate_pattern(shape, scale=0.1):
 
 class CartesianImpedanceController:
 
-    def __init__(self, arm):
+    def __init__(self, arm, k_null=10.0, d_null=3.0, v_des_max=1.0, a_des_max=5.0):
         self.arm = arm
+        # Null-space posture: jis joint config pe robot start hua (elbow yahin rahe)
+        self.q_nominal, _ = arm.get_joint_state()
+        self.k_null = k_null
+        self.d_null = d_null
+        # Desired velocity / acceleration from successive setpoints (finite differences)
+        self.prev_pos_des = None
+        self.prev_v_des = np.zeros(3)
+        self.v_des_max = v_des_max   # faster "velocity" = setpoint jump -> ignore
+        self.a_des_max = a_des_max   # same idea for acceleration
 
     def step(self, pos_des, quat_des, K_trans, K_rot, damping_ratio=1.0):
-        # ----------------------------------------------------------------------
-        # TODO 2: Implement the Cartesian impedance torque law.
-        # Inputs:
-        #   pos_des: (3,) desired position
-        #   quat_des: (4,) desired orientation quaternion
-        #   K_trans: (3,) translational stiffness (x,y,z)
-        #   K_rot: (3,) rotational stiffness (x,y,z)
-        #   damping_ratio: scalar
-        # Returns:
-        #   tau: (7,) joint torques
-        #   info: dict for logging (provided in solution)
-        # ----------------------------------------------------------------------
-        raise NotImplementedError("TODO 2: Write the math for the impedance controller to calculate the required joint torques.")
+        # TODO 2: Cartesian impedance torque law
+        pos_des = np.asarray(pos_des, dtype=float)
+        q, qdot = self.arm.get_joint_state()
+        J = self.arm.jacobian(q, qdot)                   # (6,7) tool-tip Jacobian
+        pos, quat, _, _ = self.arm.get_tool_pose()
+
+        xdot = J @ qdot                                  # [v; w] tool twist
+        v, w = xdot[:3], xdot[3:]
+
+        # Desired velocity & acceleration from setpoint changes (zero on jumps)
+        jump = self.prev_pos_des is None
+        v_des = np.zeros(3)
+        if not jump:
+            v_des = (pos_des - self.prev_pos_des) / DT
+            if np.linalg.norm(v_des) > self.v_des_max:
+                v_des = np.zeros(3)
+                jump = True
+        a_des = np.zeros(3) if jump else (v_des - self.prev_v_des) / DT
+        if np.linalg.norm(a_des) > self.a_des_max:
+            a_des = np.zeros(3)
+        self.prev_pos_des = pos_des.copy()
+        self.prev_v_des = v_des.copy()
+
+        # Errors (convention: current - desired)
+        e_pos = pos - pos_des
+        e_rot = quat_to_axis_angle_error(quat, quat_des)
+
+        # Stiffness & damping: D = 2*zeta*sqrt(K*m)
+        K_t = np.asarray(K_trans, dtype=float)
+        K_r = np.asarray(K_rot, dtype=float)
+        D_t = 2.0 * damping_ratio * np.sqrt(K_t * REFLECTED_MASS_TRANS)
+        D_r = 2.0 * damping_ratio * np.sqrt(K_r * REFLECTED_INERTIA_ROT)
+
+        # Virtual spring-damper wrench (damping acts on velocity ERROR)
+        F = -K_t * e_pos - D_t * (v - v_des)
+        Mo = -K_r * e_rot - D_r * w
+
+        # Task-space inertia: Lambda = (J M^-1 J^T)^-1
+        Mq = np.array(p.calculateMassMatrix(self.arm.robot_id, list(q), physicsClientId=self.arm.cid))
+        Minv_JT = np.linalg.solve(Mq, J.T)
+        Lam = np.linalg.inv(J @ Minv_JT)
+
+        # Acceleration feedforward: the force needed to accelerate the arm's
+        # (coupled) inertia along the desired path, so lateral motion does
+        # not leak into the normal (z) contact force.
+        wrench = np.concatenate([F, Mo]) + Lam @ np.concatenate([a_des, np.zeros(3)])
+
+        # Task torque + gravity compensation
+        tau = J.T @ wrench + self.arm.gravity_compensation(q)
+
+        # Dynamically-consistent null-space posture torque (does not disturb the tool)
+        J_bar = Minv_JT @ Lam
+        N = np.eye(len(q)) - J.T @ J_bar.T
+        tau += N @ (-self.k_null * (q - self.q_nominal) - self.d_null * qdot)
+
+        info = dict(e_pos=e_pos, e_rot=e_rot, wrench=wrench, v_des=v_des, a_des=a_des)
+        return tau, info
+
 
 
 # ==============================================================================
@@ -71,13 +166,61 @@ class AdmittanceController:
 
     def step(self, f_measured, f_desired, dt, xc_limit=0.03, xc_dot_limit=0.08):
         """
-        TODO 3: Implement admittance mass-damper outer loop step.
+        TODO 3: Admittance mass-damper outer loop step.
+            M * xc_ddot + B * xc_dot = f_measured - f_desired
+        Positive xc raises the setpoint (too much force -> back off).
         Returns: float (self.xc)
         """
-        raise NotImplementedError("TODO 3: Write the code to update the admittance mass-damper system over time.")
+        e_f = f_measured - f_desired                       # force error
+        xc_ddot = (e_f - self.B * self.xc_dot) / self.M    # virtual dynamics
+
+        # Semi-implicit Euler: velocity first, then position with the NEW velocity
+        self.xc_dot += xc_ddot * dt
+        self.xc_dot = float(np.clip(self.xc_dot, -xc_dot_limit, xc_dot_limit))
+        self.xc += self.xc_dot * dt
+
+        # Position limit + anti-windup (don't keep pushing into the limit)
+        if self.xc > xc_limit:
+            self.xc = xc_limit
+            self.xc_dot = min(self.xc_dot, 0.0)
+        elif self.xc < -xc_limit:
+            self.xc = -xc_limit
+            self.xc_dot = max(self.xc_dot, 0.0)
+
+        return float(self.xc)
 
 ADMITTANCE_NOMINAL_PENETRATION = 0.015
+# Critically damped virtual damping (Part A (d)): B = 2*sqrt(M * K_eff), where
+# K_eff is the inner position loop (600 N/m) in SERIES with the contact (750 N/m)
+# -- the inner loop is not perfectly stiff, so K_eff = 333 N/m (not K_e = 750).
+K_EFF_ADMITTANCE = 1.0 / (1.0 / 600.0 + 1.0 / 750.0)
+ADMITTANCE_DAMPING_CRIT = 2.0 * np.sqrt(ADMITTANCE_MASS * K_EFF_ADMITTANCE)   # ~44.7 N.s/m
+# Effective contact stiffness of tool-on-surface (Bullet combines the two
+# bodies' contactStiffness in series: 1/(1/1500 + 1/1500) = 750 N/m)
+CONTACT_STIFFNESS_EFF = 750.0
 
+# Smooth pen-down for impedance writing: descend to 2 mm above the surface
+# (APP_T1), ramp the setpoint into the surface (APP_T2), then hold so the
+# contact force settles at F_des before the stroke starts (APP_HOLD).
+APP_T1, APP_T2, APP_HOLD = 0.30, 0.40, 0.50
+
+# Shift the writing 5 cm away from the robot base. At x < ~0.40 m the KUKA
+# elbow (joint 3) hits its -2.094 rad limit and the joint-limit constraint
+# absorbs part of the commanded force (measured: 4.34 N instead of 5.0 N).
+WRITE_X_OFFSET = 0.05
+# Writing impedance: stiff in the plane (accurate tracking against friction),
+# compliant only along the surface normal (z) to regulate contact force.
+# damping_ratio per axis: z uses ~2.5 so that the CONTACT system
+# (robot 150 + surface 750 = 900 N/m) is ~critically damped.
+GAINS_WRITE_IMPEDANCE = dict(
+    K_trans=np.array([800., 800., 150.]), K_rot=np.array([30., 30., 30.]),
+    damping_ratio=np.array([1.5, 1.5, 2.5]))
+
+
+def impedance_contact_z(world, f_desired, K_z):
+    """Virtual setpoint below the surface that yields f_desired with
+    robot spring (K_z) and contact spring (CONTACT_STIFFNESS_EFF) in series."""
+    return world.surface_top_z + TOOL_RADIUS - f_desired * (1.0 / K_z + 1.0 / CONTACT_STIFFNESS_EFF)
 
 # ==============================================================================
 # LIVE VISUALIZATION (TODO 8)
@@ -147,9 +290,12 @@ def build_stroke_plan(world, letter_origin_xy, word=None, pattern=None):
     if word:
         strokes.extend(get_word_strokes(word))
     if pattern:
-        pattern_strokes = generate_pattern(pattern)
-        offset = 0.5 if word else 0.0
-        pattern_strokes = [[(px + offset, py) for (px, py) in seg] for seg in pattern_strokes]
+        pattern_scale = 0.06                       # 6 cm, fits comfortably on the surface
+        pattern_strokes = generate_pattern(pattern, scale=pattern_scale)
+        # Place pattern centred BELOW the word (the original +0.5 m x-offset
+        # pushed it off the 0.4 m-wide writing surface)
+        y_off = -(pattern_scale / 2 + 0.02) if word else 0.0
+        pattern_strokes = [[(px, py + y_off) for (px, py) in seg] for seg in pattern_strokes]
         strokes.extend(pattern_strokes)
         
     plan = []
@@ -165,8 +311,8 @@ def build_stroke_plan(world, letter_origin_xy, word=None, pattern=None):
 
 
 def run_writing_task(world, ctrl, controller_mode, f_desired, gui=False, save_dir="outputs", tag="writing", word="Robot", pattern=None, live=False):
-    plan = build_stroke_plan(world, world.surface_center_xy, word=word, pattern=pattern)
-    adm = AdmittanceController()
+    plan = build_stroke_plan(world, world.surface_center_xy + np.array([WRITE_X_OFFSET, 0.0]), word=word, pattern=pattern)
+    adm = AdmittanceController(damping=ADMITTANCE_DAMPING_CRIT)
 
     drawer = TrajectoryDrawer(world.cid, color=(0, 0, 0)) if gui else None
     dashboard = LiveDashboard(mode="writing") if live else None
@@ -207,15 +353,28 @@ def run_writing_task(world, ctrl, controller_mode, f_desired, gui=False, save_di
         else:
             if prev_kind != "down":
                 adm.reset()
-                z_start = world.surface_top_z + PEN_LIFT_HEIGHT
-                z_end = world.surface_top_z + TOOL_RADIUS
-                traj_app = MinJerkTrajectory(np.array([xy_from[0], xy_from[1], z_start]), np.array([xy_from[0], xy_from[1], z_end]), 0.15)
-                for step in range(int(0.15 / DT)):
-                    pos_des, _ = traj_app.eval(step * DT)
-                    tau, _ = ctrl.step(pos_des, world.nominal_quat, GAINS_PEN_UP["K_trans"], GAINS_PEN_UP["K_rot"], GAINS_PEN_UP["damping_ratio"])
-                    world.arm.apply_joint_torques(tau)
-                    p.stepSimulation(physicsClientId=world.cid)
-                    world.arm.clamp_joint_velocities()
+                z_lift = world.surface_top_z + PEN_LIFT_HEIGHT
+                z_touch = world.surface_top_z + TOOL_RADIUS
+                # Smooth two-phase pen-down (both controllers): descend to 2 mm above
+                # the surface, ramp the setpoint to its nominal contact depth, hold.
+                if controller_mode == "admittance":
+                    g = GAINS_INNER_STIFF
+                    z_contact = z_touch - ADMITTANCE_NOMINAL_PENETRATION   # ~5 N with xc = 0
+                else:
+                    g = GAINS_WRITE_IMPEDANCE
+                    z_contact = impedance_contact_z(world, f_desired, g["K_trans"][2])
+                phases = [(z_lift, z_touch + 0.002, APP_T1, 0.0, g),
+                          (z_touch + 0.002, z_contact, APP_T2, APP_HOLD, g)]
+                for z_a, z_b, T_move, T_hold, g_app in phases:
+                    traj_app = MinJerkTrajectory(np.array([xy_from[0], xy_from[1], z_a]),
+                                                 np.array([xy_from[0], xy_from[1], z_b]), T_move)
+                    for step in range(int((T_move + T_hold) / DT)):
+                        pos_des, _ = traj_app.eval(step * DT)   # eval clips at end -> hold
+                        tau, _ = ctrl.step(pos_des, world.nominal_quat,
+                                           g_app["K_trans"], g_app["K_rot"], g_app["damping_ratio"])
+                        world.arm.apply_joint_torques(tau)
+                        p.stepSimulation(physicsClientId=world.cid)
+                        world.arm.clamp_joint_velocities()
                 
             stroke_len = np.linalg.norm(xy_to - xy_from)
             duration = max(stroke_len / STROKE_SPEED, 0.15)
@@ -231,12 +390,11 @@ def run_writing_task(world, ctrl, controller_mode, f_desired, gui=False, save_di
                     z_des = world.surface_top_z + TOOL_RADIUS - ADMITTANCE_NOMINAL_PENETRATION + xc
                     gains = GAINS_INNER_STIFF
                 else:
-                    # ----------------------------------------------------------
                     # TODO 2 (continued): Impedance Writing
-                    # Write the logic to achieve the desired 5N contact force.
-                    # ----------------------------------------------------------
-                    raise NotImplementedError("TODO 2 (continued): Write the logic to achieve the desired 5N contact force.")
-                    gains = GAINS_IMPEDANCE
+                    # Robot spring (K_z) and contact spring in series:
+                    #   F = d / (1/K_z + 1/K_contact)  ->  d = F * (1/K_z + 1/K_contact)
+                    gains = GAINS_WRITE_IMPEDANCE
+                    z_des = impedance_contact_z(world, f_desired, gains["K_trans"][2])
 
                 pos_des = np.array([xy_pos[0], xy_pos[1], z_des])
                 tau, _ = ctrl.step(pos_des, world.nominal_quat, gains["K_trans"], gains["K_rot"], gains["damping_ratio"])
@@ -263,12 +421,31 @@ def run_writing_task(world, ctrl, controller_mode, f_desired, gui=False, save_di
     
     # --------------------------------------------------------------------------
     # TODO 4: Compute Metrics
-    # Compute force tracking RMSE (only when f_des > 0) and path smoothness (mean squared jerk).
-    # Store them in variables named `rmse` and `smoothness`.
     # --------------------------------------------------------------------------
-    raise NotImplementedError("TODO 4: Calculate the error between the desired force and the actual measured force.")
-    rmse = 0.0
-    smoothness = 0.0
+    f_meas = arr["force"][:, 2]
+    f_des_arr = arr["force_des"]
+    contact = f_des_arr > 0
+
+    # Force tracking RMSE (pen-down samples only)
+    if contact.any():
+        rmse = float(np.sqrt(np.mean((f_meas[contact] - f_des_arr[contact]) ** 2)))
+    else:
+        rmse = 0.0
+
+    # Mean squared jerk, computed separately on each continuous pen-down run
+    # (avoids fake jerk spikes at the unlogged approach gaps between strokes)
+    edges = np.diff(np.concatenate([[0], contact.astype(int), [0]]))
+    starts, ends = np.where(edges == 1)[0], np.where(edges == -1)[0]
+    jerk_sq = []
+    for s0, s1 in zip(starts, ends):
+        seg = arr["pos"][s0:s1]
+        if len(seg) < 4:
+            continue
+        vel = np.gradient(seg, DT, axis=0)
+        acc = np.gradient(vel, DT, axis=0)
+        jerk = np.gradient(acc, DT, axis=0)
+        jerk_sq.append(np.sum(jerk ** 2, axis=1))
+    smoothness = float(np.mean(np.concatenate(jerk_sq))) if jerk_sq else 0.0
     
     plot_force_tracking(arr, os.path.join(save_dir, f"{tag}_force_tracking.png"), title=f"{tag}: Force Tracking While Writing")
     plot_xy_path(arr, os.path.join(save_dir, f"{tag}_xy_path.png"), title=f"{tag}: Traced Path (top-down)")
